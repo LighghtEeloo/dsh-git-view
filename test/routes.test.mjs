@@ -9,9 +9,9 @@
  * Run with: node test/routes.test.mjs
  */
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, statSync, lstatSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, statSync, lstatSync, readdirSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve as resolvePath } from 'node:path';
+import { basename, join, resolve as resolvePath } from 'node:path';
 import assert from 'node:assert/strict';
 
 import { apply } from '../index.js';
@@ -68,7 +68,16 @@ const subprocess = {
 
 /** The filesystem capability, backed by the real one for this scratch tree. */
 const fs = {
-  resolve: async path => ({ path: resolvePath(path) }),
+  resolve: async path => {
+    const displayPath = resolvePath(path);
+    let targetKey;
+    try {
+      targetKey = realpathSync(displayPath);
+    } catch {
+      targetKey = displayPath;
+    }
+    return { path: displayPath, displayPath, targetKey };
+  },
   stat: async target => {
     const info = statSync(target.path);
     return { type: info.isDirectory() ? 'directory' : 'file', size: info.size, version: `v${info.mtimeMs}-${info.size}` };
@@ -352,6 +361,51 @@ try {
   await check('an unknown path is refused rather than invented', async () => {
     const { status } = await call('/api/git.file', { sessionId: 's', path: 'nope.txt', side: 'worktree' });
     assert.equal(status, 404);
+  });
+
+  await check('a file read path that could leave the repository is refused', async () => {
+    const outside = join(repo, '..', `dsh-git-view-outside-${process.pid}.txt`);
+    writeFileSync(outside, 'outside\n');
+    try {
+      const { status } = await call('/api/git.file', {
+        sessionId: 's',
+        path: `../${basename(outside)}`,
+        side: 'worktree',
+      });
+      assert.equal(status, 400, 'the file route accepted a path outside the repository');
+    } finally {
+      rmSync(outside, { force: true });
+    }
+  });
+
+  await check('an untracked diff path that could leave the repository is refused', async () => {
+    const outside = join(repo, '..', `dsh-git-view-outside-${process.pid}.txt`);
+    writeFileSync(outside, 'outside\n');
+    try {
+      const { status } = await call('/api/git.diff', {
+        sessionId: 's',
+        path: `../${basename(outside)}`,
+        side: 'untracked',
+      });
+      assert.equal(status, 400, 'the diff route accepted a path outside the repository');
+    } finally {
+      rmSync(outside, { force: true });
+    }
+  });
+
+  await check('a symlink target outside the repository is refused', async () => {
+    if (process.platform === 'win32') return; // symlink creation may require elevation
+    const outside = join(tmpdir(), `dsh-git-view-outside-${process.pid}.txt`);
+    const link = join(repo, 'link-secret');
+    writeFileSync(outside, 'outside\n');
+    symlinkSync(outside, link);
+    try {
+      const { status } = await call('/api/git.file', { sessionId: 's', path: 'link-secret', side: 'worktree' });
+      assert.equal(status, 404, 'a symlink target outside the repository was served');
+    } finally {
+      rmSync(link, { force: true });
+      rmSync(outside, { force: true });
+    }
   });
 
   await check('a missing session identity is refused', async () => {

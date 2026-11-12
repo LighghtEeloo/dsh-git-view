@@ -3,7 +3,7 @@
  * Git is the only source of truth, and write routes run only from an explicit
  * user action in the browser, never on a timer.
  */
-import { join, resolve as resolvePath } from 'node:path';
+import { isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path';
 
 /**
  * Services required: authenticated routes, session working directories, git
@@ -678,12 +678,46 @@ function countLines(hunks) {
 }
 
 /**
+ * The canonical identity a resolved target carries.
+ *
+ * Containment needs the backend's realpath identity (`targetKey`); a lexical
+ * display path cannot prove that a symlink stays inside. Backends without one
+ * fail closed.
+ *
+ * @param {object | undefined} target - a resolved filesystem target.
+ * @returns {string | undefined} the absolute path, or undefined.
+ */
+function targetKey(target) {
+  const value = target?.targetKey;
+  return typeof value === 'string' && isAbsolute(value) ? value : undefined;
+}
+
+/**
+ * Whether a resolved target still sits under the repository root.
+ *
+ * Compared through the target identity rather than the request path: a symlink
+ * inside the repository that points outside it must not become a read.
+ *
+ * @param {object | undefined} rootTarget - resolved repository root.
+ * @param {object | undefined} target - resolved requested file.
+ * @returns {boolean} true when the target is the root or one of its descendants.
+ */
+function insideRoot(rootTarget, target) {
+  const root = targetKey(rootTarget);
+  const leaf = targetKey(target);
+  if (root === undefined || leaf === undefined) return false;
+  const rel = relative(root, leaf);
+  return rel === '' || (rel !== '..' && !rel.startsWith('..' + sep) && !isAbsolute(rel));
+}
+
+/**
  * Read a working-tree file through the composed filesystem.
  * @returns {Promise<{ text: string, binary: boolean } | { oversized: true } | undefined>}
  */
 async function readWorktreeFile(ctx, root, path, signal) {
+  const rootTarget = await ctx.fs.resolve(root, { signal });
   const target = await ctx.fs.resolve(join(root, path), { signal });
-  if (target === undefined) return undefined;
+  if (!insideRoot(rootTarget, target)) return undefined;
   const info = await ctx.fs.stat(target, signal).catch(() => undefined);
   if (info === undefined || info.type !== 'file') return undefined;
   if (info.size !== undefined && info.size > FILE_MAX_BYTES) return { oversized: true };
@@ -734,8 +768,9 @@ function inlineKind(path) {
  *   or undefined when the file is gone.
  */
 async function readWorktreeBytes(ctx, root, path, signal) {
+  const rootTarget = await ctx.fs.resolve(root, { signal });
   const target = await ctx.fs.resolve(join(root, path), { signal });
-  if (target === undefined) return undefined;
+  if (!insideRoot(rootTarget, target)) return undefined;
   const info = await ctx.fs.stat(target, signal).catch(() => undefined);
   if (info === undefined || info.type !== 'file') return undefined;
   if (info.size !== undefined && info.size > PREVIEW_MAX_BYTES) return null;
@@ -952,10 +987,13 @@ async function handleUntracked(ctx, git, request) {
   const ready = await prepare(ctx, git, request);
   if (ready instanceof Response) return ready;
   const root = ready.root;
-  const dir = new URL(request.url).searchParams.get('dir') ?? '';
-  // The trailing slash marks a directory and `..` is refused; a bare filename
-  // would otherwise buy a scan of the whole repository.
-  if (!dir.endsWith('/') || dir.includes('..')) return fail('dir is one untracked directory path.', 400);
+  const raw = new URL(request.url).searchParams.get('dir') ?? '';
+  // The trailing slash marks a directory and `safePath` refuses traversal; a bare
+  // filename would otherwise buy a scan of the whole repository.
+  if (!raw.endsWith('/')) return fail('dir is one untracked directory path.', 400);
+  const base = safePath(raw.slice(0, -1));
+  if (base === undefined) return fail('dir is one untracked directory path.', 400);
+  const dir = `${base}/`;
 
   // Scoped to one directory, so the cost is that directory and not the repository.
   const result = await git.run(
@@ -989,9 +1027,9 @@ async function handleDiff(ctx, git, request) {
   if (ready instanceof Response) return ready;
   const root = ready.root;
   const query = new URL(request.url).searchParams;
-  const path = query.get('path');
+  const path = safePath(query.get('path'));
   const side = query.get('side') ?? 'unstaged';
-  if (!path) return fail('path is required.');
+  if (path === undefined) return fail('That path is not one this view reads.');
   if (!['staged', 'unstaged', 'untracked'].includes(side)) return fail('side is staged, unstaged, or untracked.');
 
   if (side === 'untracked') {
@@ -1029,9 +1067,9 @@ async function handleFile(ctx, git, request) {
   if (ready instanceof Response) return ready;
   const root = ready.root;
   const query = new URL(request.url).searchParams;
-  const path = query.get('path');
+  const path = safePath(query.get('path'));
   const side = query.get('side') ?? 'worktree';
-  if (!path) return fail('path is required.');
+  if (path === undefined) return fail('That path is not one this view reads.');
   if (!['staged', 'head', 'worktree'].includes(side)) return fail('side is staged, head, or worktree.');
 
   if (side === 'worktree') {
